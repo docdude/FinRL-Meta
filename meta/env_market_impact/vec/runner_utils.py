@@ -427,7 +427,7 @@ def _estimate_state_action_dims(
     stock_dim = int(np.asarray(config["price_array"]).shape[1])
     tech_dim = int(np.asarray(config["tech_array"]).shape[1])
 
-    if env_class.__name__ == "MACEVecEnv":
+    if env_class.__name__ in ("MACEVecEnv", "IntensityMACEVecEnv"):
         params = env_kwargs["params"]
         state_dim = 1 + (3 * stock_dim) + tech_dim
         if params.include_permanent_impact_in_state:
@@ -436,6 +436,11 @@ def _estimate_state_action_dims(
             state_dim += stock_dim
         if params.include_tbill_in_state:
             state_dim += 1
+        # IntensityTimingWrapper augments with J + hold_age + entry_ratio per stock
+        if env_class.__name__ == "IntensityMACEVecEnv":
+            intensity_kwargs = env_kwargs.get("intensity_kwargs", {})
+            if intensity_kwargs.get("augment_state", True):
+                state_dim += 3 * stock_dim
         return state_dim, stock_dim
 
     if env_class.__name__ == "MarginTraderVecEnv":
