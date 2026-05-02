@@ -2,10 +2,10 @@ import datetime
 import math
 import random
 
-import gym
+import gymnasium as gym
 import numpy as np
-from gym import spaces
-from gym.utils import seeding
+from gymnasium import spaces
+from gymnasium.utils import seeding
 from stable_baselines3.common.vec_env import DummyVecEnv
 
 from meta.env_fx_trading.util.log_render import render_to_file

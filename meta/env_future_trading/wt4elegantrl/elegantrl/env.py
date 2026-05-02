@@ -1,7 +1,7 @@
 import os
 from copy import deepcopy
 
-import gym  # not necessary
+import gymnasium as gym  # not necessary
 import numpy as np
 
 """[ElegantRL.2021.11.08](https://github.com/AI4Finance-Foundation/ElegantRL)"""

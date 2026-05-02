@@ -145,3 +145,18 @@ price_array.npy
 
 # vscode
 /.vscode
+
+# Local experiment outputs
+/backtest_results/
+/outputs_rl_stopping/
+/tensorboard_log/
+/.paper_figs/
+/meta/env_market_impact/backtest_results/
+/meta/env_market_impact/data/
+/meta/env_market_impact/hpo_results/
+/meta/env_market_impact/tensorboard_log/
+
+# Generated root-level artifacts
+/*.png
+/*.csv
+/*.log

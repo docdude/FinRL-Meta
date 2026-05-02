@@ -40,6 +40,7 @@ from meta.env_market_impact.envs.impact_models import (
 from meta.env_market_impact.envs.market_data import MarketDataPreparator, Split
 from meta.env_market_impact.backtest_report_generator import BacktestReportGenerator
 from meta.env_market_impact.envs.utils import get_logger, compute_performance_stats
+from meta.data_processors._base import DataSource
 from agents.stablebaselines3_models import DRLAgent, TensorboardCallback
 from stable_baselines3.common.vec_env import DummyVecEnv
 
@@ -359,6 +360,7 @@ def run_example():
         tech_indicators=INDICATORS,
         train_ratio=0.9,
         benchmark_ticker="QQEW",
+        data_source=DataSource.yahoofinance,
     )
 
     # Build grid: each algorithm × baseline vs AC impact

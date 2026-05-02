@@ -20,6 +20,8 @@ Usage::
     python optuna_optimize.py          # uses defaults in run_example()
 """
 
+import argparse
+import glob
 import json
 import os
 import sys
@@ -56,6 +58,7 @@ from meta.env_market_impact.example_mace_env import (
     train_and_backtest,
 )
 from meta.env_market_impact.backtest_report_generator import BacktestReportGenerator
+from meta.data_processors._base import DataSource
 from agents.stablebaselines3_models import DRLAgent
 from stable_baselines3.common.vec_env import DummyVecEnv
 
@@ -311,6 +314,7 @@ def run_optimization(
     n_startup_trials: int = 5,
     n_warmup_steps: int = 3,
     seed: int = 42,
+    storage_path: str | None = None,
 ) -> optuna.Study:
     """Create an Optuna study and optimise the given configuration.
 
@@ -361,12 +365,29 @@ def run_optimization(
         n_startup_trials=n_startup_trials,
         n_warmup_steps=n_warmup_steps,
     )
+    study_name = f"hpo_{model_name}_{impact_model_class().__class__.__name__}"
+    storage = None
+    if storage_path is not None:
+        os.makedirs(os.path.dirname(storage_path) or ".", exist_ok=True)
+        storage = f"sqlite:///{storage_path}"
     study = optuna.create_study(
         direction="maximize",
         sampler=sampler,
         pruner=pruner,
-        study_name=f"hpo_{model_name}_{impact_model_class().__class__.__name__}",
+        study_name=study_name,
+        storage=storage,
+        load_if_exists=storage is not None,
     )
+
+    already_complete = sum(
+        1 for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE
+    )
+    if already_complete > 0:
+        log.info(
+            f"Resumed study '{study_name}' with {already_complete} completed trials "
+            f"(target n_trials={n_trials})."
+        )
+    remaining = max(0, n_trials - len(study.trials))
 
     study.optimize(
         lambda trial: objective(
@@ -380,7 +401,7 @@ def run_optimization(
             num_epochs=num_epochs,
             seed=seed,
         ),
-        n_trials=n_trials,
+        n_trials=remaining,
         show_progress_bar=True,
     )
 
@@ -499,14 +520,54 @@ def save_best_params(study: optuna.Study, path: str) -> None:
     log.info(f"Best params saved to {path}")
 
 
-def run_multi_agent_hpo():
+class _StaticStudy:
+    """Minimal stand-in exposing ``best_params`` / ``best_value`` for agents
+    whose results were loaded from a prior ``*_best_params.json`` rather
+    than an in-memory Optuna study."""
+
+    def __init__(self, best_params: dict, best_value: float, trial_number: int):
+        self.best_params = best_params
+        self.best_value = best_value
+
+        class _T:
+            pass
+
+        self.best_trial = _T()
+        self.best_trial.number = trial_number
+
+
+def _load_best_params_json(path: str) -> _StaticStudy | None:
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        data = json.load(f)
+    return _StaticStudy(
+        best_params=data["params"],
+        best_value=data["best_oos_annualized_sharpe"],
+        trial_number=data["trial_number"],
+    )
+
+
+def run_multi_agent_hpo(
+    resume_dir: str | None = None,
+    agents_to_optimize: list[str] | None = None,
+    n_trials: int = 100,
+    num_epochs: int = 20,
+):
     """Run HPO for multiple agents sequentially, save results, then
     produce a single comparison backtest report with all best configs
     plus baselines.
 
-    Designed for overnight runs::
-
-        python optuna_optimize.py
+    Parameters
+    ----------
+    resume_dir : str or None
+        If given, re-use this ``hpo_results/<ts>`` directory: sqlite study
+        storage is kept there (so trials resume across crashes / SSH drops),
+        and any existing ``{agent}_best_params.json`` files are loaded into
+        the final comparison grid even if that agent isn't re-optimised.
+    agents_to_optimize : list[str] or None
+        Agents to run HPO on this invocation. Defaults to the full set
+        ``["a2c", "ppo", "ddpg", "sac", "td3"]``.
     """
     np.random.seed(42)
 
@@ -521,22 +582,43 @@ def run_multi_agent_hpo():
         tech_indicators=INDICATORS,
         train_ratio=0.9,
         benchmark_ticker="QQEW",
+        data_source=DataSource.yahoofinance,
     )
 
     # ── HPO settings ─────────────────────────────────────────────────
-    agents_to_optimize = ["a2c", "ppo", "ddpg", "sac", "td3"]
+    if agents_to_optimize is None:
+        agents_to_optimize = ["a2c", "ppo", "ddpg", "sac", "td3"]
+
     impact_model_class = ACImpactModel
     initial_capital = 1e9
-    num_epochs = 20
-    n_trials = 100
 
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    results_dir = f"hpo_results/{ts}"
-    os.makedirs(results_dir, exist_ok=True)
+    if resume_dir is not None:
+        results_dir = resume_dir
+        os.makedirs(results_dir, exist_ok=True)
+        log.info(f"Resuming HPO in existing directory: {results_dir}")
+    else:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        results_dir = f"hpo_results/{ts}"
+        os.makedirs(results_dir, exist_ok=True)
+
+    storage_path = f"{results_dir}/optuna.db"
+
+    # ── Seed best_configs from any pre-existing JSON results ────────
+    best_configs: list[dict] = []
+    seeded_agents: set[str] = set()
+    for json_path in sorted(glob.glob(f"{results_dir}/*_best_params.json")):
+        agent = os.path.basename(json_path).replace("_best_params.json", "")
+        stub = _load_best_params_json(json_path)
+        if stub is None:
+            continue
+        best_configs.append({"model_name": agent, "study": stub})
+        seeded_agents.add(agent)
+        log.info(
+            f"Loaded prior best params for '{agent}' "
+            f"(trial #{stub.best_trial.number}, Sharpe={stub.best_value:.4f})"
+        )
 
     # ── Run HPO for each agent ───────────────────────────────────────
-    best_configs: list[dict] = []  # collect best params per agent
-
     for model_name in agents_to_optimize:
         log.info("=" * 60)
         log.info(f"STARTING HPO: {model_name.upper()}")
@@ -550,6 +632,7 @@ def run_multi_agent_hpo():
                 initial_capital=initial_capital,
                 num_epochs=num_epochs,
                 n_trials=n_trials,
+                storage_path=storage_path,
             )
         except Exception as e:
             log.error(f"HPO failed for {model_name}: {e}")
@@ -558,6 +641,8 @@ def run_multi_agent_hpo():
         save_study_results(study, f"{results_dir}/{model_name}_study_results.json")
         save_best_params(study, f"{results_dir}/{model_name}_best_params.json")
 
+        # Replace any seeded stub for this agent with the fresh study
+        best_configs = [e for e in best_configs if e["model_name"] != model_name]
         best_configs.append(
             {
                 "model_name": model_name,
@@ -648,4 +733,40 @@ def run_multi_agent_hpo():
 
 
 if __name__ == "__main__":
-    run_multi_agent_hpo()
+    parser = argparse.ArgumentParser(
+        description="Multi-agent HPO with resumable sqlite storage.",
+    )
+    parser.add_argument(
+        "--resume-dir",
+        type=str,
+        default=None,
+        help=(
+            "Existing hpo_results/<ts> directory to resume into. Reuses "
+            "optuna.db for in-flight trials and loads any prior "
+            "{agent}_best_params.json into the final comparison grid."
+        ),
+    )
+    parser.add_argument(
+        "--agents",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated list of agents to optimise this run "
+            "(e.g. 'ddpg,sac,td3'). Default: a2c,ppo,ddpg,sac,td3."
+        ),
+    )
+    parser.add_argument("--n-trials", type=int, default=100)
+    parser.add_argument("--num-epochs", type=int, default=20)
+    args = parser.parse_args()
+
+    agents = (
+        [a.strip() for a in args.agents.split(",") if a.strip()]
+        if args.agents
+        else None
+    )
+    run_multi_agent_hpo(
+        resume_dir=args.resume_dir,
+        agents_to_optimize=agents,
+        n_trials=args.n_trials,
+        num_epochs=args.num_epochs,
+    )

@@ -1,9 +1,12 @@
+import re
 from typing import List
+from typing import Optional
 
 import alpaca_trade_api as tradeapi
 import numpy as np
 import pandas as pd
 import pytz
+from alpaca_trade_api.rest import TimeFrame
 
 try:
     import pandas_market_calendars as tc
@@ -18,8 +21,12 @@ except:
 # from basic_processor import _Base
 from meta.data_processors._base import _Base
 from meta.data_processors._base import calc_time_zone
+from meta.data_processors._credentials import get_alpaca_credentials
 
 from meta.config import (
+    ALPACA_API_BASE_URL,
+    ALPACA_API_KEY,
+    ALPACA_API_SECRET,
     TIME_ZONE_SHANGHAI,
     TIME_ZONE_USEASTERN,
     TIME_ZONE_PARIS,
@@ -32,6 +39,25 @@ from meta.config import (
 
 
 class Alpaca(_Base):
+    _INTERVAL_MAP = {
+        "1D": TimeFrame.Day,
+        "1d": TimeFrame.Day,
+        "1Day": TimeFrame.Day,
+        "day": TimeFrame.Day,
+        "1H": TimeFrame.Hour,
+        "1h": TimeFrame.Hour,
+        "1Hour": TimeFrame.Hour,
+        "1W": TimeFrame.Week,
+        "1wk": TimeFrame.Week,
+        "1Week": TimeFrame.Week,
+        "1M": TimeFrame.Month,
+        "1mo": TimeFrame.Month,
+        "1Month": TimeFrame.Month,
+        "1m": TimeFrame.Minute,
+        "1Min": TimeFrame.Minute,
+        "1Minute": TimeFrame.Minute,
+    }
+
     # def __init__(self, API_KEY=None, API_SECRET=None, API_BASE_URL=None, api=None):
     #     if api is None:
     #         try:
@@ -42,70 +68,189 @@ class Alpaca(_Base):
     #         self.api = api
     def __init__(
         self,
-        data_source: str,
-        start_date: str,
-        end_date: str,
-        time_interval: str,
+        data_source: str = "alpaca",
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        time_interval: str = "1d",
         **kwargs,
     ):
+        start_date = start_date or pd.Timestamp.utcnow().strftime("%Y-%m-%d")
+        end_date = end_date or start_date
         super().__init__(data_source, start_date, end_date, time_interval, **kwargs)
-        if kwargs["API"] is None:
+        self.time_interval = str(self.convert_interval(time_interval))
+        self.data_feed = kwargs.get("DATA_FEED") or kwargs.get("data_feed") or "sip"
+        self.trim_to_common_panel = bool(
+            kwargs.get(
+                "TRIM_TO_COMMON_PANEL",
+                kwargs.get("trim_to_common_panel", False),
+            )
+        )
+        api = kwargs.get("API", kwargs.get("api"))
+        credentials = get_alpaca_credentials(kwargs.get("DOTENV_PATH"))
+        api_key = kwargs.get("API_KEY") or kwargs.get("api_key") or credentials["API_KEY"]
+        api_secret = kwargs.get("API_SECRET") or kwargs.get("api_secret") or credentials["API_SECRET"]
+        api_base_url = (
+            kwargs.get("API_BASE_URL")
+            or kwargs.get("api_base_url")
+            or credentials["API_BASE_URL"]
+            or ALPACA_API_BASE_URL
+        )
+        if not api_key and ALPACA_API_KEY != "xxx":
+            api_key = ALPACA_API_KEY
+        if not api_secret and ALPACA_API_SECRET != "xxx":
+            api_secret = ALPACA_API_SECRET
+
+        if api is None:
+            if not api_key or not api_secret:
+                raise ValueError(
+                    "Missing Alpaca credentials. Set ALPACA_API_KEY and "
+                    "ALPACA_API_SECRET in the environment or repo-root .env."
+                )
             try:
                 self.api = tradeapi.REST(
-                    kwargs["API_KEY"],
-                    kwargs["API_SECRET"],
-                    kwargs["API_BASE_URL"],
+                    api_key,
+                    api_secret,
+                    api_base_url,
                     "v2",
                 )
             except BaseException:
                 raise ValueError("Wrong Account Info!")
         else:
-            self.api = kwargs["API"]
+            self.api = api
+
+    @classmethod
+    def convert_interval(cls, time_interval: str) -> TimeFrame:
+        time_interval = time_interval.strip()
+        if time_interval in cls._INTERVAL_MAP:
+            return cls._INTERVAL_MAP[time_interval]
+
+        minute_match = re.match(r"^(\d+)(m|Min|Minute)$", time_interval, re.IGNORECASE)
+        if minute_match:
+            amount = int(minute_match.group(1))
+            if amount == 60:
+                return TimeFrame.Hour
+            if amount > 59:
+                raise ValueError(
+                    "alpaca_trade_api does not support minute multipliers above 59. "
+                    f"Use an hourly interval instead of '{time_interval}'."
+                )
+            return TimeFrame(amount=amount, unit=TimeFrame.Minute.unit)
+
+        hour_match = re.match(r"^(\d+)(h|H|Hour)$", time_interval, re.IGNORECASE)
+        if hour_match:
+            amount = int(hour_match.group(1))
+            return TimeFrame(amount=amount, unit=TimeFrame.Hour.unit)
+
+        day_match = re.match(r"^(\d+)(d|D|Day)$", time_interval, re.IGNORECASE)
+        if day_match:
+            amount = int(day_match.group(1))
+            return TimeFrame(amount=amount, unit=TimeFrame.Day.unit)
+
+        supported = ", ".join(sorted(cls._INTERVAL_MAP))
+        raise ValueError(
+            f"Unsupported Alpaca time interval '{time_interval}'. Supported: {supported}"
+        )
+
+    @staticmethod
+    def _is_daily_interval(time_interval: str) -> bool:
+        return time_interval.endswith("Day") or time_interval.endswith("Week") or time_interval.endswith("Month")
+
+    @staticmethod
+    def _interval_step_minutes(time_interval: str) -> int:
+        minute_match = re.match(r"^(\d+)Min$", time_interval)
+        if minute_match:
+            return int(minute_match.group(1))
+        hour_match = re.match(r"^(\d+)Hour$", time_interval)
+        if hour_match:
+            return int(hour_match.group(1)) * 60
+        return 1
+
+    def _build_expected_times(self, trading_days: list[str]) -> list[str]:
+        if self._is_daily_interval(self.time_interval):
+            return trading_days
+
+        times: list[str] = []
+        step_minutes = self._interval_step_minutes(self.time_interval)
+        for day in trading_days:
+            current_time = pd.Timestamp(day + " 09:30:00").tz_localize(self.time_zone)
+            close_time = pd.Timestamp(day + " 16:00:00").tz_localize(self.time_zone)
+            while current_time < close_time:
+                times.append(current_time.strftime("%Y-%m-%d %H:%M:%S"))
+                current_time += pd.Timedelta(minutes=step_minutes)
+        return times
 
     def download_data(
         self,
         ticker_list,
-        start_date,
-        end_date,
-        time_interval,
+        start_date=None,
+        end_date=None,
+        time_interval=None,
         save_path: str = "./data/dataset.csv",
     ) -> pd.DataFrame:
         self.time_zone = calc_time_zone(
             ticker_list, TIME_ZONE_SELFDEFINED, USE_TIME_ZONE_SELFDEFINED
         )
-        start_date = pd.Timestamp(self.start_date, tz=self.time_zone)
-        end_date = pd.Timestamp(self.end_date, tz=self.time_zone) + pd.Timedelta(days=1)
+        start_date = pd.Timestamp(start_date or self.start_date, tz=self.time_zone)
+        end_date = pd.Timestamp(end_date or self.end_date, tz=self.time_zone) + pd.Timedelta(days=1)
+        timeframe = self.convert_interval(time_interval or self.time_interval)
+        time_interval = str(timeframe)
         self.time_interval = time_interval
 
-        date = start_date
-        data_df = pd.DataFrame()
-        while date != end_date:
-            start_time = (date + pd.Timedelta("09:30:00")).isoformat()
-            end_time = (date + pd.Timedelta("15:59:00")).isoformat()
+        frames = []
+        if self._is_daily_interval(time_interval):
             for tic in ticker_list:
                 barset = self.api.get_bars(
                     tic,
-                    time_interval,
-                    start=start_time,
-                    end=end_time,
-                    limit=500,
+                    timeframe,
+                    start=start_date.date().isoformat(),
+                    end=end_date.date().isoformat(),
+                    limit=10_000,
+                    feed=self.data_feed,
                 ).df
+                if barset.empty:
+                    continue
                 barset["tic"] = tic
-                barset = barset.reset_index()
-                data_df = data_df.append(barset)
-            print(("Data before ") + end_time + " is successfully fetched")
-            # print(data_df.head())
-            date = date + pd.Timedelta(days=1)
-            if date.isoformat()[-14:-6] == "01:00:00":
-                date = date - pd.Timedelta("01:00:00")
-            elif date.isoformat()[-14:-6] == "23:00:00":
-                date = date + pd.Timedelta("01:00:00")
-            if date.isoformat()[-14:-6] != "00:00:00":
-                raise ValueError("Timezone Error")
+                frames.append(barset.reset_index())
+            print(
+                f"Daily data through {end_date.date().isoformat()} fetched successfully"
+            )
+        else:
+            date = start_date
+            while date != end_date:
+                start_time = (date + pd.Timedelta("09:30:00")).isoformat()
+                end_time = (date + pd.Timedelta("15:59:00")).isoformat()
+                for tic in ticker_list:
+                    barset = self.api.get_bars(
+                        tic,
+                        timeframe,
+                        start=start_time,
+                        end=end_time,
+                        limit=500,
+                        feed=self.data_feed,
+                    ).df
+                    if barset.empty:
+                        continue
+                    barset["tic"] = tic
+                    frames.append(barset.reset_index())
+                print(("Data before ") + end_time + " is successfully fetched")
+                date = date + pd.Timedelta(days=1)
+                if date.isoformat()[-14:-6] == "01:00:00":
+                    date = date - pd.Timedelta("01:00:00")
+                elif date.isoformat()[-14:-6] == "23:00:00":
+                    date = date + pd.Timedelta("01:00:00")
+                if date.isoformat()[-14:-6] != "00:00:00":
+                    raise ValueError("Timezone Error")
 
-        data_df["time"] = data_df["timestamp"].apply(
-            lambda x: x.strftime("%Y-%m-%d %H:%M:%S")
-        )
+        data_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        if data_df.empty:
+            raise ValueError("No Alpaca bars returned for the requested range.")
+
+        if self._is_daily_interval(time_interval):
+            data_df["time"] = data_df["timestamp"].apply(lambda x: x.strftime("%Y-%m-%d"))
+        else:
+            data_df["time"] = data_df["timestamp"].apply(
+                lambda x: x.strftime("%Y-%m-%d %H:%M:%S")
+            )
         self.dataframe = data_df
 
         self.save_data(save_path)
@@ -118,16 +263,47 @@ class Alpaca(_Base):
         df = self.dataframe.copy()
         tic_list = np.unique(df.tic.values)
 
-        trading_days = self.get_trading_days(start=self.start, end=self.end)
-        # produce full time index
-        times = []
-        for day in trading_days:
-            current_time = pd.Timestamp(day + " 09:30:00").tz_localize(self.time_zone)
-            for _ in range(390):
-                times.append(current_time)
-                current_time += pd.Timedelta(minutes=1)
-        # create a new dataframe with full time series
-        new_df = pd.DataFrame()
+        trading_days = self.get_trading_days(
+            start=self.start_date,
+            end=max(self.end_date, str(df["time"].max())[:10]),
+        )
+        times = self._build_expected_times(trading_days)
+        if self.trim_to_common_panel:
+            available_times = {
+                tic: set(df.loc[df.tic == tic, "time"].astype(str).tolist())
+                for tic in tic_list
+            }
+            common_time_set = None
+            for time_set in available_times.values():
+                if common_time_set is None:
+                    common_time_set = set(time_set)
+                else:
+                    common_time_set &= time_set
+
+            if not common_time_set:
+                raise ValueError(
+                    "No common Alpaca timestamps across the requested tickers. "
+                    "Try a shorter date range or remove symbols with sparse history."
+                )
+
+            first_common_time = min(common_time_set)
+            last_common_time = max(common_time_set)
+            times = [
+                time for time in times if first_common_time <= time <= last_common_time
+            ]
+
+            if not times:
+                raise ValueError(
+                    "Unable to build a common Alpaca panel from the requested date range."
+                )
+
+            print(
+                "Trimmed Alpaca panel to common coverage window",
+                f"{times[0]} -> {times[-1]}",
+                "to avoid synthetic leading or trailing fills.",
+            )
+
+        frames = []
         for tic in tic_list:
             tmp_df = pd.DataFrame(
                 columns=["open", "high", "low", "close", "volume"], index=times
@@ -138,7 +314,6 @@ class Alpaca(_Base):
                     ["open", "high", "low", "close", "volume"]
                 ]
 
-            # if the close price of the first row is NaN
             if str(tmp_df.iloc[0]["close"]) == "nan":
                 print(
                     "The price of the first row for ticker ",
@@ -157,20 +332,14 @@ class Alpaca(_Base):
                             0.0,
                         ]
                         break
-            # if the close price of the first row is still NaN (All the prices are NaN in this case)
+
             if str(tmp_df.iloc[0]["close"]) == "nan":
                 print(
                     "Missing data for ticker: ",
                     tic,
                     " . The prices are all NaN. Fill with 0.",
                 )
-                tmp_df.iloc[0] = [
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                ]
+                tmp_df.iloc[0] = [0.0, 0.0, 0.0, 0.0, 0.0]
 
             # forward filling row by row
             for i in range(tmp_df.shape[0]):
@@ -186,9 +355,14 @@ class Alpaca(_Base):
                         0.0,
                     ]
             tmp_df = tmp_df.astype(float)
+            tmp_df["adjusted_close"] = tmp_df["close"]
+            tmp_df = tmp_df[
+                ["open", "high", "low", "close", "adjusted_close", "volume"]
+            ]
             tmp_df["tic"] = tic
-            new_df = new_df.append(tmp_df)
+            frames.append(tmp_df)
 
+        new_df = pd.concat(frames, axis=0)
         new_df = new_df.reset_index()
         new_df = new_df.rename(columns={"index": "time"})
 
@@ -342,16 +516,28 @@ class Alpaca(_Base):
     def fetch_latest_data(
         self, ticker_list, time_interval, tech_indicator_list, limit=100
     ) -> pd.DataFrame:
-        data_df = pd.DataFrame()
+        timeframe = self.convert_interval(time_interval)
+        normalized_interval = str(timeframe)
+        frames = []
         for tic in ticker_list:
-            barset = self.api.get_barset([tic], time_interval, limit=limit).df[tic]
+            barset = self.api.get_bars(
+                tic,
+                timeframe,
+                limit=limit,
+                feed=self.data_feed,
+            ).df
+            if barset.empty:
+                continue
             barset["tic"] = tic
-            barset = barset.reset_index()
-            data_df = data_df.append(barset)
+            frames.append(barset.reset_index())
 
-        data_df = data_df.reset_index(drop=True)
-        start_time = data_df.time.min()
-        end_time = data_df.time.max()
+        if not frames:
+            raise ValueError("No Alpaca bars returned for latest-data request.")
+
+        data_df = pd.concat(frames, ignore_index=True).reset_index(drop=True)
+        timestamp_col = "timestamp" if "timestamp" in data_df.columns else "time"
+        start_time = data_df[timestamp_col].min()
+        end_time = data_df[timestamp_col].max()
         times = []
         current_time = start_time
         end = end_time + pd.Timedelta(minutes=1)
@@ -360,14 +546,14 @@ class Alpaca(_Base):
             current_time += pd.Timedelta(minutes=1)
 
         df = data_df.copy()
-        new_df = pd.DataFrame()
+        normalized_frames = []
         for tic in ticker_list:
             tmp_df = pd.DataFrame(
                 columns=["open", "high", "low", "close", "volume"], index=times
             )
             tic_df = df[df.tic == tic]
             for i in range(tic_df.shape[0]):
-                tmp_df.loc[tic_df.iloc[i]["time"]] = tic_df.iloc[i][
+                tmp_df.loc[tic_df.iloc[i][timestamp_col]] = tic_df.iloc[i][
                     ["open", "high", "low", "close", "volume"]
                 ]
 
@@ -411,8 +597,9 @@ class Alpaca(_Base):
                     ]
             tmp_df = tmp_df.astype(float)
             tmp_df["tic"] = tic
-            new_df = new_df.append(tmp_df)
+            normalized_frames.append(tmp_df)
 
+        new_df = pd.concat(normalized_frames, axis=0)
         new_df = new_df.reset_index()
         new_df = new_df.rename(columns={"index": "time"})
 
@@ -424,19 +611,25 @@ class Alpaca(_Base):
         )
         latest_price = price_array[-1]
         latest_tech = tech_array[-1]
-        turb_df = self.api.get_barset(["VIXY"], time_interval, limit=1).df["VIXY"]
+        turb_df = self.api.get_bars(
+            "VIXY",
+            timeframe,
+            limit=1,
+            feed=self.data_feed,
+        ).df
         latest_turb = turb_df["close"].values
         return latest_price, latest_tech, latest_turb
 
     def get_portfolio_history(self, start, end):
         trading_days = self.get_trading_days(start, end)
-        df = pd.DataFrame()
+        frames = []
         for day in trading_days:
-            df = df.append(
+            frames.append(
                 self.api.get_portfolio_history(
                     date_start=day, timeframe="5Min"
                 ).df.iloc[:79]
             )
+        df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
         equities = df.equity.values
         cumu_returns = equities / equities[0]
         cumu_returns = cumu_returns[~np.isnan(cumu_returns)]

@@ -22,18 +22,44 @@ from meta.env_market_impact.envs.env_portfolio_optimization_impact import (
     PortfolioOptimizationImpactEnv,
 )
 from meta.env_market_impact.envs.impact_models import (
-    SqrtImpactModel,
     ACImpactModel,
     BaselineImpactModel,
 )
 from meta.env_market_impact.envs.market_data import MarketDataPreparator, Split
 from meta.env_market_impact.backtest_report_generator import BacktestReportGenerator
 from meta.env_market_impact.envs.utils import get_logger, compute_performance_stats
-from meta.env_market_impact.backtest_config import MODEL_KWARGS, NET_ARCH
+from meta.env_market_impact.backtest_config import (
+    EXPLORATORY_SCALAR_IMPACT_MODELS,
+    MODEL_KWARGS,
+    NET_ARCH,
+)
+from meta.data_processors._base import DataSource
 from agents.stablebaselines3_models import DRLAgent, TensorboardCallback
 from stable_baselines3.common.vec_env import DummyVecEnv
 
 log = get_logger()
+
+POE_AGENT_NAMES = ("a2c", "ppo", "ddpg", "sac", "td3")
+
+
+def build_exploratory_poe_configs(initial_amount: float = 1e9) -> list[dict]:
+    """Default-only scalar POE runs for Sqrt/OW impact models.
+
+    The paper reports baseline vs. AC in POE. We keep that comparison intact
+    and append Sqrt/OW as exploratory runs so their behavior can be compared
+    later without fabricating tuned hyperparameters.
+    """
+
+    return [
+        {
+            "model_name": agent_name,
+            "impact_model_class": impact_cls,
+            "env_kwargs": {"initial_amount": initial_amount},
+            "run_type": "exploratory",
+        }
+        for agent_name in POE_AGENT_NAMES
+        for impact_cls in EXPLORATORY_SCALAR_IMPACT_MODELS
+    ]
 
 
 # ── Simulation helper ─────────────────────────────────────────────────
@@ -339,6 +365,7 @@ def run_example():
         tech_indicators=INDICATORS,
         train_ratio=0.9,
         benchmark_ticker="QQEW",
+        data_source=DataSource.yahoofinance,
     )
 
     # ── Baseline configs (default params) ────────────────────────────
@@ -498,7 +525,7 @@ def run_example():
                 }
             )
 
-    configs = baseline_configs + hpo_configs
+    configs = baseline_configs + hpo_configs + build_exploratory_poe_configs()
 
     summary = train_and_backtest(data_prep, configs, num_epochs=num_epochs)
     BacktestReportGenerator(summary).generate_report()

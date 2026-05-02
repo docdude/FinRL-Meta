@@ -10,8 +10,8 @@ from elegantrl.run import Arguments
 from elegantrl.run import train_and_evaluate
 from envs_simple_cta import SimpleCTAEnv
 from envs_simple_cta import SimpleCTASubProcessEnv
-from gym import make
-from gym import register
+from gymnasium import make
+from gymnasium import register
 from numpy import inf
 
 # from elegantrl.agent import AgentPPO as Agent

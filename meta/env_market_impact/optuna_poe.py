@@ -27,6 +27,7 @@ from meta.env_market_impact.envs.market_data import MarketDataPreparator, Split
 from meta.env_market_impact.envs.utils import get_logger, compute_performance_stats
 from meta.env_market_impact.backtest_config import NET_ARCH, MODEL_KWARGS
 from meta.env_market_impact.example_poe import run_and_log_simulation
+from meta.data_processors._base import DataSource
 from agents.stablebaselines3_models import DRLAgent
 from stable_baselines3.common.vec_env import DummyVecEnv
 
@@ -184,6 +185,7 @@ def run_multi_agent_hpo():
         tech_indicators=INDICATORS,
         train_ratio=0.9,
         benchmark_ticker="QQEW",
+        data_source=DataSource.yahoofinance,
     )
     agents = ["a2c", "ppo", "ddpg", "sac", "td3"]
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")

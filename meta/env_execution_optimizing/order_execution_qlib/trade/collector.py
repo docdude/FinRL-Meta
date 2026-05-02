@@ -9,7 +9,7 @@ from typing import List
 from typing import Optional
 from typing import Union
 
-import gym
+import gymnasium as gym
 import numpy as np
 import torch
 from tianshou.data import Batch

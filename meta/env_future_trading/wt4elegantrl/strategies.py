@@ -2,10 +2,10 @@ from abc import abstractmethod
 
 from assessments import Assessment
 from features import Feature
-from gym.spaces import Box
-from gym.spaces import Discrete
-from gym.spaces import MultiDiscrete
-from gym.spaces import Space
+from gymnasium.spaces import Box
+from gymnasium.spaces import Discrete
+from gymnasium.spaces import MultiDiscrete
+from gymnasium.spaces import Space
 from numpy import around
 from numpy import float32
 from stoppers import Stopper

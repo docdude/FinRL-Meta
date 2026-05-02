@@ -15,6 +15,7 @@ Usage:
     gen.make_chart(Chart.PORTFOLIO_VALUE)
 """
 
+import html
 import json
 import math
 import os
@@ -28,6 +29,7 @@ import plotly.graph_objects as go
 import plotly.io as pio
 from plotly.subplots import make_subplots
 
+from .backtest_summary_utils import enrich_summary_payload
 from .envs.utils import compute_performance_stats
 from .envs.utils import get_logger
 from .envs.utils import rolling_sharpe
@@ -185,11 +187,11 @@ class BacktestReportGenerator:
                 names and table labels.  Overrides the automatic varying-key
                 detection when provided.
         """
-        log.info(f"Loading backtest data from {summary_json_path}")
+        log.info("Loading backtest data from %s", summary_json_path)
         self._summary_dir = os.path.dirname(summary_json_path)
 
-        with open(summary_json_path, "r") as f:
-            summary_data = json.load(f)
+        with open(summary_json_path, "r", encoding="utf-8") as f:
+            summary_data = enrich_summary_payload(json.load(f))
 
         backtests_metadata = summary_data["backtests"]
         if filters:
@@ -199,7 +201,11 @@ class BacktestReportGenerator:
                 for m in backtests_metadata
                 if all(m.get(k) == v for k, v in filters.items())
             ]
-            log.info(f"{len(backtests_metadata)} filtered backtests of {prev_count}")
+            log.info(
+                "%s filtered backtests of %s",
+                len(backtests_metadata),
+                prev_count,
+            )
         if exclude_filters:
             prev_count = len(backtests_metadata)
             backtests_metadata = [
@@ -208,15 +214,23 @@ class BacktestReportGenerator:
                 if not all(m.get(k) == v for k, v in exclude_filters.items())
             ]
             log.info(
-                f"{len(backtests_metadata)} backtests after exclusion filter ({prev_count - len(backtests_metadata)} excluded)"
+                "%s backtests after exclusion filter (%s excluded)",
+                len(backtests_metadata),
+                prev_count - len(backtests_metadata),
             )
 
         self._benchmark_ticker: str = summary_data["benchmark_ticker"]
+        self._summary_suite_kind: str = summary_data.get(
+            "summary_suite_kind", ""
+        )
         if display_keys is not None:
             self._varying_keys: set[str] = set(display_keys)
         else:
             self._varying_keys: set[str] = self._get_varying_param_keys(
                 backtests_metadata
+            )
+            self._varying_keys.update(
+                self._get_forced_display_keys(backtests_metadata)
             )
         self._split_date = None
 
@@ -389,11 +403,14 @@ class BacktestReportGenerator:
             div = pio.to_html(fig, full_html=False, include_plotlyjs=False)
             chart_divs.append(div)
 
-        html = self._wrap_html(chart_divs)
+        report_html = self._wrap_html(
+            chart_divs,
+            self._build_report_summary_html(),
+        )
         with open(output_path, "w", encoding="utf-8") as f:
-            f.write(html)
+            f.write(report_html)
 
-        log.info(f"Report generated at {output_path}")
+        log.info("Report generated at %s", output_path)
         return output_path
 
     def _make_portfolio_value(self) -> go.Figure:
@@ -1349,7 +1366,7 @@ class BacktestReportGenerator:
         return daily
 
     @staticmethod
-    def _wrap_html(chart_divs: list[str]) -> str:
+    def _wrap_html(chart_divs: list[str], summary_html: str = "") -> str:
         """Wrap individual chart HTML divs into a complete HTML page."""
         body = "\n<hr>\n".join(chart_divs)
         return (
@@ -1359,10 +1376,16 @@ class BacktestReportGenerator:
             '  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>\n'
             "  <style>\n"
             "    body { font-family: Arial, sans-serif; margin: 20px; }\n"
+            "    section { margin-bottom: 24px; }\n"
+            "    .summary-table { border-collapse: collapse; width: 100%; margin-top: 8px; }\n"
+            "    .summary-table th, .summary-table td { border: 1px solid #d1d5db; padding: 8px; text-align: left; font-size: 13px; }\n"
+            "    .summary-table th { background: #e5eef9; }\n"
+            "    .summary-table tr:nth-child(even) { background: #f8fafc; }\n"
             "    hr { border: none; border-top: 1px solid #ddd; margin: 10px 0; }\n"
             "  </style>\n"
             "</head>\n<body>\n"
             "  <h1>Backtest Performance Comparison</h1>\n"
+            f"  {summary_html}\n"
             f"  {body}\n"
             "</body>\n</html>"
         )
@@ -1377,6 +1400,13 @@ class BacktestReportGenerator:
         trades_blank_path: str = None,
     ):
         """Load and prepare training and testing data with calculated metrics."""
+        train_csv_path = self._resolve_input_path(train_csv_path)
+        test_csv_path = self._resolve_input_path(test_csv_path)
+        test_blank_csv_path = self._resolve_input_path(test_blank_csv_path)
+        trades_train_path = self._resolve_input_path(trades_train_path)
+        trades_test_path = self._resolve_input_path(trades_test_path)
+        trades_blank_path = self._resolve_input_path(trades_blank_path)
+
         df_train = pd.read_csv(train_csv_path)
         df_test = pd.read_csv(test_csv_path)
         df_test_blank = pd.read_csv(test_blank_csv_path)
@@ -1468,6 +1498,26 @@ class BacktestReportGenerator:
 
         return df_train, df_test, df_test_blank, trades_train, trades_test, trades_blank
 
+    def _resolve_input_path(self, path: str | None) -> str | None:
+        if not path:
+            return path
+        if os.path.isabs(path):
+            return path
+
+        candidates = [
+            path,
+            os.path.join(self._summary_dir, path),
+            os.path.join(os.path.dirname(self._summary_dir), path),
+            os.path.join(os.path.dirname(os.path.dirname(self._summary_dir)), path),
+        ]
+        for candidate in candidates:
+            if os.path.exists(candidate):
+                return candidate
+        return os.path.join(
+            os.path.dirname(os.path.dirname(self._summary_dir)),
+            path,
+        )
+
     def _get_color_info(self, i: int):
         """Get RGB color information for plotting."""
         color_hex = self.colors[i % len(self.colors)]
@@ -1516,6 +1566,8 @@ class BacktestReportGenerator:
         ]
 
     _KEY_PRIORITY = [
+        "run_scope",
+        "suite_role",
         "run_type",
         "drl_agent",
         "impact_model",
@@ -1531,6 +1583,10 @@ class BacktestReportGenerator:
         "learning_rate",
         "gamma",
         "ent_coef",
+        "training_engine",
+        "num_envs",
+        "repeat_times",
+        "batch_size",
         "net_arch",
     ]
 
@@ -1587,6 +1643,8 @@ class BacktestReportGenerator:
             if key in varying_keys and key in metadata and metadata[key] is not None:
                 parts.append(f"{label}={fmt(metadata[key])}")
 
+        add("Scope", "run_scope", str)
+        add("Role", "suite_role", str)
         add("Type", "run_type", str)
         add("Agent", "drl_agent", lambda x: str(x).upper())
         add("Impact", "impact_model", str)
@@ -1606,6 +1664,10 @@ class BacktestReportGenerator:
             "ent_coef",
             lambda x: f"{float(x):.3f}" if isinstance(x, (int, float)) else str(x),
         )
+        add("Engine", "training_engine", str)
+        add("Envs", "num_envs", lambda x: str(int(x)))
+        add("Rpt", "repeat_times", lambda x: f"{float(x):g}")
+        add("Batch", "batch_size", lambda x: str(int(x)))
         add("Arch", "net_arch", str)
 
         if not parts and "drl_agent" in metadata:
@@ -1623,6 +1685,8 @@ class BacktestReportGenerator:
             if key in varying_keys and key in metadata and metadata[key] is not None:
                 parts.append(str(fmt(metadata[key])))
 
+        add("run_scope", str)
+        add("suite_role", str)
         add("run_type", str)
         add("drl_agent", lambda x: str(x).upper())
         add("impact_model", str)
@@ -1641,11 +1705,127 @@ class BacktestReportGenerator:
             "ent_coef",
             lambda x: f"e={float(x):.3f}" if isinstance(x, (int, float)) else f"e={x}",
         )
+        add("training_engine", lambda x: f"eng={x}")
+        add("num_envs", lambda x: f"envs={int(x)}")
+        add("repeat_times", lambda x: f"rt={float(x):g}")
+        add("batch_size", lambda x: f"bs={int(x)}")
         add("net_arch", lambda x: f"a={x}")
 
         return (
             self._truncate_parts(parts, "-", self._MAX_SHORT_NAME_LEN)
             or str(metadata.get("drl_agent", "Backtest")).upper()
+        )
+
+    def _get_forced_display_keys(self, metadatas: list[dict]) -> set[str]:
+        if not str(self._summary_suite_kind).startswith("vec"):
+            return set()
+
+        forced_keys = {
+            "impact_model",
+            "training_engine",
+            "num_envs",
+            "repeat_times",
+        }
+        return {
+            key
+            for key in forced_keys
+            if any(metadata.get(key) is not None for metadata in metadatas)
+        }
+
+    @staticmethod
+    def _format_summary_metric(value):
+        if value in (None, ""):
+            return ""
+        try:
+            numeric_value = float(value)
+        except (TypeError, ValueError):
+            return str(value)
+        if abs(numeric_value) >= 10000:
+            return f"{numeric_value:,.2f}"
+        return f"{numeric_value:,.3f}"
+
+    def _build_report_summary_html(self) -> str:
+        sections = [self._build_run_catalog_html(), self._build_best_oos_html()]
+        return "\n".join(section for section in sections if section)
+
+    def _build_run_catalog_html(self) -> str:
+        rows = []
+        for bt in self._backtests:
+            metadata = bt["metadata"]
+            rows.append(
+                {
+                    "Backtest": bt["short_name"],
+                    "Scope": metadata.get("run_scope", ""),
+                    "Role": metadata.get("suite_role", ""),
+                    "Agent": str(metadata.get("drl_agent", "")).upper(),
+                    "Impact": metadata.get("impact_model", ""),
+                    "Horizon": metadata.get("horizon", ""),
+                    "Obs Norm": metadata.get("use_obs_normalizer", ""),
+                    "Engine": metadata.get("training_engine", "scalar"),
+                    "Num Envs": metadata.get("num_envs", ""),
+                    "Repeat": metadata.get("repeat_times", ""),
+                    "Batch": metadata.get("batch_size", ""),
+                    "LR": metadata.get("learning_rate", ""),
+                }
+            )
+
+        if not rows:
+            return ""
+
+        catalog_df = pd.DataFrame(rows)
+        suite_label = self._summary_suite_kind.replace("_", " ").title()
+        return (
+            f"<section><h2>Run Catalog</h2><p>Suite: {html.escape(suite_label)}</p>"
+            f"{catalog_df.to_html(index=False, classes='summary-table', border=0)}"
+            "</section>"
+        )
+
+    def _build_best_oos_html(self) -> str:
+        rows = []
+        for bt in self._backtests:
+            metadata = bt["metadata"]
+            best = metadata.get("best_epoch_stats_test_blank") or {}
+            final = metadata.get("final_epoch_stats_test_blank") or {}
+            if not best:
+                continue
+            rows.append(
+                {
+                    "Backtest": bt["short_name"],
+                    "Role": metadata.get("suite_role", ""),
+                    "Best Epoch": best.get("epoch", ""),
+                    "Best Ann Sharpe": self._format_summary_metric(
+                        best.get("annualized_sharpe")
+                    ),
+                    "Best Ann Return": self._format_summary_metric(
+                        best.get("annualized_return")
+                    ),
+                    "Best Cost": self._format_summary_metric(
+                        best.get("total_trading_cost")
+                    ),
+                    "Best Turnover": self._format_summary_metric(
+                        best.get("avg_daily_turnover")
+                    ),
+                    "Final Ann Sharpe": self._format_summary_metric(
+                        final.get("annualized_sharpe")
+                    ),
+                    "Final Cost": self._format_summary_metric(
+                        final.get("total_trading_cost")
+                    ),
+                    "Final Turnover": self._format_summary_metric(
+                        final.get("avg_daily_turnover")
+                    ),
+                }
+            )
+
+        if not rows:
+            return ""
+
+        best_df = pd.DataFrame(rows)
+        return (
+            "<section><h2>Best OOS Checkpoints</h2>"
+            "<p>Best checkpoint is selected by blank-slate out-of-sample annualized Sharpe.</p>"
+            f"{best_df.to_html(index=False, classes='summary-table', border=0)}"
+            "</section>"
         )
 
     @staticmethod

@@ -41,6 +41,8 @@ from meta.env_market_impact.envs.market_data import MarketDataPreparator, Split
 from meta.env_market_impact.backtest_report_generator import BacktestReportGenerator
 from meta.env_market_impact.backtest_config import BacktestParams, MODEL_KWARGS
 from meta.env_market_impact.envs.utils import get_logger, compute_performance_stats
+from meta.env_market_impact.backtest_summary_utils import prepare_summary_payload
+from meta.data_processors._base import DataSource
 from agents.stablebaselines3_models import DRLAgent, TensorboardCallback
 from stable_baselines3.common.vec_env import DummyVecEnv
 
@@ -440,11 +442,11 @@ def train_and_backtest(
 
     # Save all metadata to a single JSON file for the run
     summary_filename = f"{results_dir}/backtest_summary.json"
-    summary_data = {
-        "benchmark_ticker": benchmark_ticker,
-        "backtests": all_backtests_metadata,
-    }
-    with open(summary_filename, "w") as f:
+    summary_data = prepare_summary_payload(
+        benchmark_ticker=benchmark_ticker,
+        backtests=all_backtests_metadata,
+    )
+    with open(summary_filename, "w", encoding="utf-8") as f:
         json.dump(summary_data, f, indent=4, default=str)
     log.info(f"All backtest metadata saved to {summary_filename}")
     return summary_filename
@@ -468,6 +470,7 @@ def run_example():
         tech_indicators=INDICATORS,
         train_ratio=0.9,
         benchmark_ticker="QQEW",
+        data_source=DataSource.yahoofinance,
         # benchmark_ticker="RSP",
     )
 

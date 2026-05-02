@@ -3,10 +3,10 @@ import math
 
 import numpy as np
 import pandas as pd
-from gym.spaces import Box
-from gym.spaces import Discrete
-from gym.spaces import MultiDiscrete
-from gym.spaces import Tuple
+from gymnasium.spaces import Box
+from gymnasium.spaces import Discrete
+from gymnasium.spaces import MultiDiscrete
+from gymnasium.spaces import Tuple
 
 
 class BaseObs(object):

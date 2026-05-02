@@ -43,6 +43,7 @@ class DataSource(Enum):
     quantconnect = "quantconnect"
     rqdata = "rqdata"
     ricequant = "ricequant"
+    tiingo = "tiingo"
     tushare = "tushare"
     wrds = "wrds"
     yahoofinance = "yahoofinance"

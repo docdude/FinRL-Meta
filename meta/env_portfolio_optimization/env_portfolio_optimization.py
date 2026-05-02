@@ -2,12 +2,12 @@
 
 import math
 
-import gym
+import gymnasium as gym
 import matplotlib
 import numpy as np
 import pandas as pd
-from gym import spaces
-from gym.utils import seeding
+from gymnasium import spaces
+from gymnasium.utils import seeding
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt

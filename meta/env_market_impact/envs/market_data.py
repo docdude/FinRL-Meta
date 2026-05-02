@@ -25,11 +25,14 @@ import os
 
 import numpy as np
 import pandas as pd
+import requests
 
 from .utils import get_logger
 from meta.data_processor import DataProcessor
 from meta.data_processors._base import DataSource
 from meta.data_processors._base import IndicatorLib
+from meta.data_processors.fred import fetch_fred_series_df
+from meta.data_processors.fred import is_fred_series_ticker
 
 log = get_logger()
 
@@ -62,9 +65,14 @@ class MarketDataPreparator:
     benchmark_ticker : str
         Ticker used as the portfolio benchmark (e.g. ``"SPY"``,
         ``"QQEW"``).
-    rf_ticker : str
+    rf_ticker : str | None
         Ticker for the risk-free rate proxy.  Defaults to ``"^IRX"``
-        (13-week T-bill yield).
+        (13-week T-bill yield). When ``None``, a constant synthetic
+        risk-free series is used instead. Prefix with ``"fred:"`` to
+        fetch a FRED series independently of the market-data provider,
+        e.g. ``"fred:DTB3"``.
+    rf_constant : float
+        Constant risk-free rate value used when ``rf_ticker`` is ``None``.
     data_source : DataSource
         Which market-data provider to use.  Defaults to
         ``DataSource.yahoofinance``.
@@ -73,6 +81,11 @@ class MarketDataPreparator:
         ``IndicatorLib.TALIB``.
     cache_dir : str
         Directory for pickle caches of the downloaded data.
+    time_interval : str
+        Bar interval forwarded to the underlying data processor.
+    data_source_kwargs : dict | None
+        Optional provider-specific keyword arguments forwarded to
+        :class:`meta.data_processor.DataProcessor`.
     """
 
     def __init__(
@@ -83,10 +96,14 @@ class MarketDataPreparator:
         tech_indicators: list[str],
         train_ratio: float,
         benchmark_ticker: str = "SPY",
-        rf_ticker: str = "^IRX",
+        rf_ticker: str | None = "^IRX",
+        rf_constant: float = 0.0,
         data_source: DataSource = DataSource.yahoofinance,
         indicator_lib: IndicatorLib = IndicatorLib.TALIB,
         cache_dir: str = "data",
+        time_interval: str = "1d",
+        data_source_kwargs: dict | None = None,
+        fred_api_key: str | None = None,
     ) -> None:
         self.tickers = list(tickers)
         self.start_date = start_date
@@ -95,9 +112,13 @@ class MarketDataPreparator:
         self.train_ratio = train_ratio
         self.benchmark_ticker = benchmark_ticker
         self.rf_ticker = rf_ticker
+        self.rf_constant = float(rf_constant)
         self.data_source = data_source
         self.indicator_lib = indicator_lib
         self.cache_dir = cache_dir
+        self.time_interval = time_interval
+        self.data_source_kwargs = dict(data_source_kwargs or {})
+        self.fred_api_key = fred_api_key
 
         # Fetch / load, then split
         self._prepare()
@@ -145,6 +166,11 @@ class MarketDataPreparator:
 
         rf_df = rf_df[rf_df["date"].isin(date_list)]
         tbill_rates = rf_df["close"].values
+        if tbill_rates.shape[0] != len(date_list):
+            raise ValueError(
+                "Risk-free rate series length does not match market dates. "
+                "Check rf_ticker/rf_constant configuration."
+            )
 
         return {
             "date_list": date_list,
@@ -172,15 +198,22 @@ class MarketDataPreparator:
     def _prepare(self) -> None:
         """Download (or load from cache) and separate market / benchmark / rf."""
         cache_path = self._get_cache_path()
+        legacy_cache_path = self._get_legacy_cache_path()
 
-        if not os.path.exists(cache_path):
+        if os.path.exists(cache_path):
+            log.info(f"Loading cached data from {cache_path}")
+            processed_df = pd.read_pickle(cache_path)
+        elif os.path.exists(legacy_cache_path):
+            log.info(f"Loading legacy cached data from {legacy_cache_path}")
+            processed_df = pd.read_pickle(legacy_cache_path)
+        else:
             log.info("No cache found. Fetching and processing data...")
             processed_df = self._fetch_data()
             log.info(f"Saving data to cache: {cache_path}")
             processed_df.to_pickle(cache_path)
-        else:
-            log.info(f"Loading cached data from {cache_path}")
-            processed_df = pd.read_pickle(cache_path)
+
+        self._resolve_effective_universe(processed_df)
+        processed_df = self._filter_complete_panel_dates(processed_df)
 
         self._market_df = (
             processed_df[processed_df["tic"].isin(self.tickers)]
@@ -192,16 +225,133 @@ class MarketDataPreparator:
             .sort_values(by=["date", "tic"])
             .reset_index(drop=True)
         )
-        self._rf_df = (
-            processed_df[processed_df["tic"] == self.rf_ticker]
-            .sort_values(by=["date", "tic"])
+        if self.rf_ticker is None:
+            self._rf_df = self._build_constant_rf_df()
+        elif is_fred_series_ticker(self.rf_ticker):
+            try:
+                self._rf_df = fetch_fred_series_df(
+                    series_ticker=self.rf_ticker,
+                    market_dates=self._market_df["date"]
+                    .drop_duplicates()
+                    .sort_values()
+                    .tolist(),
+                    cache_dir=self.cache_dir,
+                    api_key=self.fred_api_key,
+                )
+            except (requests.RequestException, ValueError, KeyError) as error:
+                log.warning(
+                    "FRED risk-free fetch failed for %s; using constant %.4f instead: %s",
+                    self.rf_ticker,
+                    self.rf_constant,
+                    error,
+                )
+                self._rf_df = self._build_constant_rf_df()
+        else:
+            self._rf_df = (
+                processed_df[processed_df["tic"] == self.rf_ticker]
+                .sort_values(by=["date", "tic"])
+                .reset_index(drop=True)
+            )
+
+    def _build_constant_rf_df(self) -> pd.DataFrame:
+        rf_dates = (
+            self._market_df[["date"]]
+            .drop_duplicates()
+            .sort_values(by=["date"])
             .reset_index(drop=True)
         )
+        rf_dates["tic"] = "RF_CONST"
+        rf_dates["close"] = self.rf_constant
+        return rf_dates
+
+    def _resolve_effective_universe(self, df: pd.DataFrame) -> None:
+        """Drop requested market tickers that have no provider data at all."""
+        available_tickers = set(df["tic"].unique())
+
+        if self.benchmark_ticker not in available_tickers:
+            raise ValueError(
+                f"Benchmark ticker '{self.benchmark_ticker}' is missing from the provider data."
+            )
+
+        if (
+            self.rf_ticker is not None
+            and not is_fred_series_ticker(self.rf_ticker)
+            and self.rf_ticker not in available_tickers
+        ):
+            raise ValueError(
+                f"Risk-free ticker '{self.rf_ticker}' is missing from the provider data."
+            )
+
+        missing_tickers = [tic for tic in self.tickers if tic not in available_tickers]
+        if missing_tickers:
+            preview = ", ".join(missing_tickers[:10])
+            if len(missing_tickers) > 10:
+                preview += ", ..."
+            log.warning(
+                "Dropping %s requested market ticker(s) with no provider data: %s",
+                len(missing_tickers),
+                preview,
+            )
+            self.tickers = [tic for tic in self.tickers if tic in available_tickers]
+
+        if not self.tickers:
+            raise ValueError(
+                "None of the requested market tickers have provider data after preprocessing."
+            )
+
+    def _filter_complete_panel_dates(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Keep only dates with a rectangular market panel plus benchmark / rf rows."""
+        if df.empty:
+            return df
+
+        valid_dates = set(df["date"].unique())
+
+        market_counts = (
+            df[df["tic"].isin(self.tickers)]
+            .groupby("date")["tic"]
+            .nunique()
+        )
+        complete_market_dates = set(
+            market_counts[market_counts == len(self.tickers)].index
+        )
+        valid_dates &= complete_market_dates
+
+        benchmark_dates = set(
+            df[df["tic"] == self.benchmark_ticker]["date"].unique()
+        )
+        valid_dates &= benchmark_dates
+
+        if self.rf_ticker is not None and not is_fred_series_ticker(
+            self.rf_ticker
+        ):
+            rf_dates = set(df[df["tic"] == self.rf_ticker]["date"].unique())
+            valid_dates &= rf_dates
+
+        filtered = df[df["date"].isin(valid_dates)].copy()
+        dropped_dates = sorted(set(df["date"].unique()) - valid_dates)
+        if dropped_dates:
+            log.info(
+                "Dropping %s incomplete panel date(s); first=%s last=%s",
+                len(dropped_dates),
+                dropped_dates[0],
+                dropped_dates[-1],
+            )
+
+        return filtered.sort_values(by=["date", "tic"]).reset_index(drop=True)
 
     def _split(self) -> None:
         """Split the prepared data into train / trade sets by date."""
         unique_dates = sorted(self._market_df["date"].unique())
-        split_index = int(len(unique_dates) * self.train_ratio)
+        if not unique_dates:
+            raise ValueError(
+                "No dates remain after provider coverage filtering. "
+                "Check for globally missing tickers or benchmark coverage gaps."
+            )
+
+        split_index = min(
+            int(len(unique_dates) * self.train_ratio),
+            len(unique_dates) - 1,
+        )
         split_date = unique_dates[split_index]
 
         self._train_df = self._market_df[self._market_df.date < split_date]
@@ -228,12 +378,31 @@ class MarketDataPreparator:
         """Deterministic cache-file path based on request parameters."""
         os.makedirs(self.cache_dir, exist_ok=True)
         tickers_str = ",".join(sorted(self.tickers))
+        indicators_str = ",".join(self.tech_indicators)
+        rf_key = self._get_processed_rf_cache_key()
         cache_key = (
             f"{tickers_str}_{self.start_date}_{self.end_date}"
-            f"_{self.benchmark_ticker}_{self.rf_ticker}"
+            f"_{self.benchmark_ticker}_{rf_key}"
+            f"_{self.data_source.value}_{self.indicator_lib.name}_{self.time_interval}"
+            f"_{indicators_str}"
         )
         filename = hashlib.md5(cache_key.encode()).hexdigest() + ".pickle"
         return os.path.join(self.cache_dir, filename)
+
+    def _get_legacy_cache_path(self) -> str:
+        tickers_str = ",".join(sorted(self.tickers))
+        rf_key = self._get_processed_rf_cache_key()
+        cache_key = (
+            f"{tickers_str}_{self.start_date}_{self.end_date}"
+            f"_{self.benchmark_ticker}_{rf_key}"
+        )
+        filename = hashlib.md5(cache_key.encode()).hexdigest() + ".pickle"
+        return os.path.join(self.cache_dir, filename)
+
+    def _get_processed_rf_cache_key(self) -> str:
+        if self.rf_ticker is None or is_fred_series_ticker(self.rf_ticker):
+            return f"const:{self.rf_constant}"
+        return self.rf_ticker
 
     def _fetch_data(self) -> pd.DataFrame:
         """Download raw data, compute derived columns, and clean NaNs."""
@@ -241,11 +410,15 @@ class MarketDataPreparator:
             data_source=self.data_source,
             start_date=self.start_date,
             end_date=self.end_date,
-            time_interval="1d",
+            time_interval=self.time_interval,
+            **self.data_source_kwargs,
         )
-        p.download_data(
-            ticker_list=self.tickers + [self.benchmark_ticker, self.rf_ticker]
-        )
+        symbols = self.tickers + [self.benchmark_ticker]
+        if self.rf_ticker is not None and not is_fred_series_ticker(
+            self.rf_ticker
+        ):
+            symbols.append(self.rf_ticker)
+        p.download_data(ticker_list=symbols)
         p.clean_data()
         p.add_technical_indicator(
             self.tech_indicators,

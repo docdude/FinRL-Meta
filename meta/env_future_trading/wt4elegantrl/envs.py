@@ -4,9 +4,9 @@ from os import getpid
 
 from assessments import Assessment
 from features import Feature
-from gym import Env
-from gym.spaces import Box
-from gym.spaces import Space
+from gymnasium import Env
+from gymnasium.spaces import Box
+from gymnasium.spaces import Space
 from stoppers import Stopper
 from strategies import EngineType
 from strategies import StateTransfer

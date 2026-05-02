@@ -69,6 +69,10 @@ class DataProcessor:
             from meta.data_processors.ricequant import Ricequant
 
             processor_dict = {self.data_source: Ricequant}
+        elif self.data_source == DataSource.tiingo:
+            from meta.data_processors.tiingo import Tiingo
+
+            processor_dict = {self.data_source: Tiingo}
         elif self.data_source == DataSource.tushare:
             from meta.data_processors.tushare import Tushare
 
