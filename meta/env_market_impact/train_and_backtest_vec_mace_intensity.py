@@ -69,18 +69,49 @@ def _wrap_with_intensity(env: MACEVecEnv, **overrides) -> IntensityTimingWrapper
     return IntensityTimingWrapper(env, **kwargs)
 
 
-class IntensityMACEVecEnv:
-    """Factory-style class that creates MACEVecEnv + IntensityTimingWrapper.
+class IntensityMACEVecEnv(IntensityTimingWrapper):
+    """MACEVecEnv + IntensityTimingWrapper in one class.
 
-    ElegantRL's ``build_env(env_class, env_args)`` calls
-    ``env_class(**env_args)``, so this class acts as a constructor proxy
-    that builds the base MACE env and wraps it with the intensity gate.
+    ElegantRL's ``build_env`` calls ``kwargs_filter(cls.__init__, env_args)``
+    to select valid constructor arguments. By accepting the same signature as
+    ``MACEVecEnv.__init__`` plus ``intensity_kwargs``, the filter keeps all
+    the parameters that the base env needs.
     """
 
-    def __new__(cls, **kwargs):
-        intensity_kwargs = kwargs.pop("intensity_kwargs", {})
-        base_env = MACEVecEnv(**kwargs)
-        return _wrap_with_intensity(base_env, **intensity_kwargs)
+    def __init__(
+        self,
+        config,
+        params=None,
+        num_envs=128,
+        gpu_id=-1,
+        device=None,
+        impact_config=None,
+        impact_model=None,
+        initial_capital=1e6,
+        initial_stocks=None,
+        normalizer_state_path=None,
+        freeze_loaded_normalizer=False,
+        if_random_reset=False,
+        auto_reset=True,
+        intensity_kwargs=None,
+    ):
+        base_env = MACEVecEnv(
+            config=config,
+            params=params,
+            num_envs=num_envs,
+            gpu_id=gpu_id,
+            device=device,
+            impact_config=impact_config,
+            impact_model=impact_model,
+            initial_capital=initial_capital,
+            initial_stocks=initial_stocks,
+            normalizer_state_path=normalizer_state_path,
+            freeze_loaded_normalizer=freeze_loaded_normalizer,
+            if_random_reset=if_random_reset,
+            auto_reset=auto_reset,
+        )
+        ikw = intensity_kwargs or {}
+        super().__init__(base_env, **{**INTENSITY_DEFAULTS, **ikw})
 
 
 def _resolve_default_gpu_id(gpu_id: int | None) -> int:
