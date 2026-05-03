@@ -208,8 +208,8 @@ class IntensityTimingWrapper:
     # ------------------------------------------------------------------
     # reset
     # ------------------------------------------------------------------
-    def reset(self) -> Tuple[th.Tensor, dict]:
-        state, info = self.base_env.reset()
+    def reset(self, **kwargs) -> Tuple[th.Tensor, dict]:
+        state, info = self.base_env.reset(**kwargs)
         self._J.zero_()
         self._hold_age.zero_()
         self._entry_price.zero_()
