@@ -4,7 +4,7 @@ alpaca_trade_api>=2.1.0
 ccxt>=1.90.41
 elegantrl
 gputil>=1.4.0
-gym>=0.17 #gym>=0.24.1
+gymnasium>=1.2.0 #gym>=0.24.1
 jqdatasdk>=1.8.10
 lz4>=4.0.1
 
